@@ -56,6 +56,50 @@ functions. The example for [Unmarshalling
 interfaces](oj/example_interface_test.go) demonstrates a feature that
 allows interfaces to be marshalled and unmarshalled.
 
+### Duplicate Object Keys
+
+JSON objects with duplicate keys are valid JSON but collapse to a single
+map entry when parsed. The `gen` and `oj` parsers share a configurable
+policy for this, set through the `DupKey` field of either parser with the
+shared `ojg.DupKeyOptions` type:
+
+```golang
+    var p oj.Parser
+    p.DupKey = ojg.DupKeyOptions{Policy: ojg.DupKeyReport}
+    v, err := p.ParseString(`{"a":1,"a":2}`)
+    dups, total := p.DupKeyDiags()
+```
+
+The four policies are:
+
+ - `ojg.DupKeyLast` (default): keep the last value. This is the historical
+   behavior and adds no overhead.
+ - `ojg.DupKeyFirst`: keep the first value; later values are parsed and
+   discarded.
+ - `ojg.DupKeyReject`: stop with an `*ojg.DupKeyError` as soon as a
+   duplicate key is detected, before the value of the duplicate key is
+   allocated.
+ - `ojg.DupKeyReport`: keep the last value and record an
+   `ojg.DupKeyDiag` for every duplicate.
+
+Each diagnostic reports the JSON Pointer (RFC 6901) path, the decoded key,
+and the byte offsets of the first and duplicate key tokens in the raw
+UTF-8 input. Keys are compared after decoding, so `"a"` and
+`"\u0061"` are duplicates, while equal keys in different objects are
+not. The policy
+applies uniformly to `Parse`, `ParseReader`, and chunked streams.
+
+In report mode the number of retained diagnostics, the path length, and
+the retained raw input fragment are capped by `MaxDiags`, `MaxPath`, and
+`MaxSnippet` (negative values remove the caps) so hostile input can not
+exhaust memory. The total number of duplicates is always counted and an
+optional `OnDup` callback sees every diagnostic.
+
+Complexity: the default policy costs one branch per key. The other
+policies add one map lookup per object key, and the reject and report
+policies additionally maintain a path stack proportional to the nesting
+depth and build a diagnostic string per duplicate.
+
 ## Installation
 ```
 go get github.com/ohler55/ojg

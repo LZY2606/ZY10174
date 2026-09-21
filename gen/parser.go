@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"unicode/utf8"
+
+	"github.com/ohler55/ojg"
 )
 
 const (
@@ -36,6 +38,9 @@ type Parser struct {
 	result     Node
 	mode       string
 	nextMode   string
+	dup        ojg.DupTracker
+	baseOff    int64 // offset of buf[0] in the raw input
+	keyOff     int64 // offset of the opening quote of the current key
 
 	// OnlyOne returns an error if more than one JSON is in the string or stream.
 	OnlyOne bool
@@ -43,6 +48,17 @@ type Parser struct {
 	// Reuse maps. Previously returned maps will no longer be valid or rather
 	// could be modified during parsing.
 	Reuse bool
+
+	// DupKey configures the handling of duplicate object keys. The zero
+	// value keeps the last value of a duplicate key which matches the
+	// historical behavior.
+	DupKey ojg.DupKeyOptions
+}
+
+// DupKeyDiags returns the retained duplicate key diagnostics and the total
+// number of duplicates detected during the most recent parse.
+func (p *Parser) DupKeyDiags() ([]ojg.DupKeyDiag, int) {
+	return p.dup.Diags()
 }
 
 // Parse a JSON string in to simple types. An error is returned if not valid JSON.
@@ -81,10 +97,13 @@ func (p *Parser) Parse(buf []byte, args ...any) (Node, error) {
 	p.line = 1
 	p.mode = valueMap
 	p.mi = 0
+	p.dup.Reset(p.DupKey)
+	p.baseOff = 0
 	var err error
 	// Skip BOM if present.
 	if 3 < len(buf) && buf[0] == 0xEF {
 		if buf[1] == 0xBB && buf[2] == 0xBF {
+			p.baseOff = 3
 			err = p.parseBuffer(buf[3:], true)
 		} else {
 			return nil, fmt.Errorf("expected BOM at 1:3")
@@ -136,6 +155,8 @@ func (p *Parser) ParseReader(r io.Reader, args ...any) (data Node, err error) {
 	p.noff = -1
 	p.line = 1
 	p.mi = 0
+	p.dup.Reset(p.DupKey)
+	p.baseOff = 0
 	buf := make([]byte, readBufSize)
 	eof := false
 	var cnt int
@@ -155,6 +176,7 @@ func (p *Parser) ParseReader(r io.Reader, args ...any) (data Node, err error) {
 	}
 	for {
 		if 0 < skip {
+			p.baseOff = int64(skip)
 			err = p.parseBuffer(buf[skip:], eof)
 		} else {
 			err = p.parseBuffer(buf, eof)
@@ -213,6 +235,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 		case strOk:
 			p.tmp = append(p.tmp, b)
 		case keyQuote:
+			if p.dup.Enabled() {
+				p.keyOff = p.baseOff + int64(off)
+			}
 			start := off + 1
 			if len(buf) <= start {
 				p.tmp = p.tmp[:0]
@@ -228,6 +253,15 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			off += i
 			if b == '"' {
 				off++
+				if p.dup.Enabled() {
+					var raw string
+					if p.dup.TrackDiag() {
+						raw = string(buf[start-1 : off+1])
+					}
+					if err := p.dup.KeyCompleted(string(buf[start:off]), p.keyOff, raw); err != nil {
+						return err
+					}
+				}
 				p.stack = append(p.stack, Key(buf[start:off]))
 				p.mode = colonMap
 			} else {
@@ -302,6 +336,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 				m = make(Object, mapInitSize)
 			}
 			p.stack = append(p.stack, m)
+			if p.dup.Enabled() {
+				p.dup.Open(false)
+			}
 			depth++
 			continue
 		case closeObject:
@@ -315,6 +352,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			p.starts = p.starts[0:depth]
 			n := p.stack[len(p.stack)-1]
 			p.stack = p.stack[:len(p.stack)-1]
+			if p.dup.Enabled() {
+				p.dup.Close()
+			}
 			p.add(n)
 			p.mode = afterMap
 		case val0:
@@ -352,6 +392,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 		case openArray:
 			p.starts = append(p.starts, len(p.stack))
 			p.stack = append(p.stack, EmptyArray)
+			if p.dup.Enabled() {
+				p.dup.Open(true)
+			}
 			p.mode = valueMap
 			depth++
 			continue
@@ -371,6 +414,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			n := make(Array, size)
 			copy(n, p.stack[start:len(p.stack)])
 			p.stack = p.stack[0 : start-1]
+			if p.dup.Enabled() {
+				p.dup.Close()
+			}
 			p.add(n)
 			p.mode = afterMap
 		case valNull:
@@ -434,6 +480,22 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 		case strQuote:
 			p.mode = p.nextMode
 			if p.mode[':'] == colonColon {
+				if p.dup.Enabled() {
+					var raw string
+					if p.dup.TrackDiag() {
+						if start := p.keyOff - p.baseOff; 0 <= start && start <= int64(off) {
+							raw = string(buf[start : off+1])
+						} else {
+							// The key token started in an earlier
+							// buffer so only the trailing fragment
+							// of the current buffer is available.
+							raw = string(buf[:off+1])
+						}
+					}
+					if err := p.dup.KeyCompleted(string(p.tmp), p.keyOff, raw); err != nil {
+						return err
+					}
+				}
 				p.stack = append(p.stack, Key(p.tmp))
 			} else {
 				p.add(String(p.tmp))
@@ -558,18 +620,27 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			}
 		}
 	}
+	p.baseOff += int64(len(buf))
 	return nil
 }
 
 func (p *Parser) add(n Node) {
 	if 2 <= len(p.stack) {
 		if k, ok := p.stack[len(p.stack)-1].(Key); ok {
+			if p.dup.SkipAssign() {
+				p.stack = p.stack[0 : len(p.stack)-1]
+
+				return
+			}
 			obj, _ := p.stack[len(p.stack)-2].(Object)
 			obj[string(k)] = n
 			p.stack = p.stack[0 : len(p.stack)-1]
 
 			return
 		}
+	}
+	if p.dup.TrackDiag() && 0 < len(p.starts) && 0 <= p.starts[len(p.starts)-1] {
+		p.dup.ValueAdded()
 	}
 	p.stack = append(p.stack, n)
 }

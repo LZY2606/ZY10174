@@ -5,6 +5,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The structure and content of this file follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [1.28.7] - unreleased
+### Added
+- Added a configurable duplicate object key policy to the gen and oj
+  parsers. The shared ojg.DupKeyOptions supports keeping the first or
+  last value, rejecting with an error, or reporting diagnostics with
+  JSON Pointer paths and raw input byte offsets while continuing.
+
 ### Fixed
 - Fixed handling of NaN and Inf writing.
 - Moved strict option to Options to match documentation.
