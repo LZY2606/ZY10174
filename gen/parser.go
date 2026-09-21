@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"unicode/utf8"
 )
 
@@ -36,6 +37,8 @@ type Parser struct {
 	result     Node
 	mode       string
 	nextMode   string
+	dup        DupKeyTracker
+	dupFirst   bool
 
 	// OnlyOne returns an error if more than one JSON is in the string or stream.
 	OnlyOne bool
@@ -43,6 +46,11 @@ type Parser struct {
 	// Reuse maps. Previously returned maps will no longer be valid or rather
 	// could be modified during parsing.
 	Reuse bool
+
+	// DupKey controls the handling of duplicate object keys. A nil value
+	// keeps the historical behavior of keeping the last value. It can also
+	// be set by passing a *DupKeyOptions as a parse argument.
+	DupKey *DupKeyOptions
 }
 
 // Parse a JSON string in to simple types. An error is returned if not valid JSON.
@@ -62,10 +70,14 @@ func (p *Parser) Parse(buf []byte, args ...any) (Node, error) {
 			p.resultChan = ta
 			p.OnlyOne = false
 			p.Reuse = false
+		case *DupKeyOptions:
+			p.DupKey = ta
 		default:
 			return nil, fmt.Errorf("a %T is not a valid option type", a)
 		}
 	}
+	p.dup.Reset(p.DupKey)
+	p.dupFirst = p.DupKey != nil && p.DupKey.Mode == DupKeyFirst
 	if p.stack == nil {
 		p.stack = make([]Node, 0, stackInitSize)
 		p.tmp = make([]byte, 0, tmpInitSize)
@@ -85,6 +97,7 @@ func (p *Parser) Parse(buf []byte, args ...any) (Node, error) {
 	// Skip BOM if present.
 	if 3 < len(buf) && buf[0] == 0xEF {
 		if buf[1] == 0xBB && buf[2] == 0xBF {
+			p.dup.SetBase(3)
 			err = p.parseBuffer(buf[3:], true)
 		} else {
 			return nil, fmt.Errorf("expected BOM at 1:3")
@@ -118,10 +131,14 @@ func (p *Parser) ParseReader(r io.Reader, args ...any) (data Node, err error) {
 			p.resultChan = ta
 			p.OnlyOne = false
 			p.Reuse = false
+		case *DupKeyOptions:
+			p.DupKey = ta
 		default:
 			return nil, fmt.Errorf("a %T is not a valid option type", a)
 		}
 	}
+	p.dup.Reset(p.DupKey)
+	p.dupFirst = p.DupKey != nil && p.DupKey.Mode == DupKeyFirst
 	if p.stack == nil {
 		p.stack = make([]Node, 0, stackInitSize)
 		p.tmp = make([]byte, 0, tmpInitSize)
@@ -152,6 +169,7 @@ func (p *Parser) ParseReader(r io.Reader, args ...any) (data Node, err error) {
 	// Skip BOM if present.
 	if 3 < len(buf) && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF {
 		skip = 3
+		p.dup.SetBase(3)
 	}
 	for {
 		if 0 < skip {
@@ -213,6 +231,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 		case strOk:
 			p.tmp = append(p.tmp, b)
 		case keyQuote:
+			if p.dup.Active() {
+				p.dup.KeyStart(off)
+			}
 			start := off + 1
 			if len(buf) <= start {
 				p.tmp = p.tmp[:0]
@@ -228,6 +249,11 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			off += i
 			if b == '"' {
 				off++
+				if p.dup.Active() {
+					if err := p.dup.CheckKey(string(buf[start:off]), buf, off); err != nil {
+						return err
+					}
+				}
 				p.stack = append(p.stack, Key(buf[start:off]))
 				p.mode = colonMap
 			} else {
@@ -284,6 +310,10 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			p.mode = stringMap
 			continue
 		case openObject:
+			var dseg string
+			if p.dup.Active() {
+				dseg = p.dupSeg()
+			}
 			p.starts = append(p.starts, -1)
 			p.mode = key1Map
 			var m Object
@@ -302,6 +332,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 				m = make(Object, mapInitSize)
 			}
 			p.stack = append(p.stack, m)
+			if p.dup.Active() {
+				p.dup.OpenObject(dseg)
+			}
 			depth++
 			continue
 		case closeObject:
@@ -315,6 +348,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			p.starts = p.starts[0:depth]
 			n := p.stack[len(p.stack)-1]
 			p.stack = p.stack[:len(p.stack)-1]
+			if p.dup.Active() {
+				p.dup.CloseObject()
+			}
 			p.add(n)
 			p.mode = afterMap
 		case val0:
@@ -350,8 +386,15 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			p.ri = 0
 			continue
 		case openArray:
+			var dseg string
+			if p.dup.Active() {
+				dseg = p.dupSeg()
+			}
 			p.starts = append(p.starts, len(p.stack))
 			p.stack = append(p.stack, EmptyArray)
+			if p.dup.Active() {
+				p.dup.OpenArray(dseg)
+			}
 			p.mode = valueMap
 			depth++
 			continue
@@ -371,6 +414,9 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			n := make(Array, size)
 			copy(n, p.stack[start:len(p.stack)])
 			p.stack = p.stack[0 : start-1]
+			if p.dup.Active() {
+				p.dup.CloseArray()
+			}
 			p.add(n)
 			p.mode = afterMap
 		case valNull:
@@ -434,6 +480,11 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 		case strQuote:
 			p.mode = p.nextMode
 			if p.mode[':'] == colonColon {
+				if p.dup.Active() {
+					if err := p.dup.CheckKey(string(p.tmp), buf, off); err != nil {
+						return err
+					}
+				}
 				p.stack = append(p.stack, Key(p.tmp))
 			} else {
 				p.add(String(p.tmp))
@@ -558,6 +609,8 @@ func (p *Parser) parseBuffer(buf []byte, last bool) error {
 			}
 		}
 	}
+	p.dup.EndBuffer(buf)
+
 	return nil
 }
 
@@ -565,6 +618,13 @@ func (p *Parser) add(n Node) {
 	if 2 <= len(p.stack) {
 		if k, ok := p.stack[len(p.stack)-1].(Key); ok {
 			obj, _ := p.stack[len(p.stack)-2].(Object)
+			if p.dupFirst {
+				if _, dup := obj[string(k)]; dup {
+					p.stack = p.stack[0 : len(p.stack)-1]
+
+					return
+				}
+			}
 			obj[string(k)] = n
 			p.stack = p.stack[0 : len(p.stack)-1]
 
@@ -572,6 +632,20 @@ func (p *Parser) add(n Node) {
 		}
 	}
 	p.stack = append(p.stack, n)
+}
+
+// dupSeg returns the JSON Pointer segment for a container about to be opened
+// at the current parse position.
+func (p *Parser) dupSeg() string {
+	if 0 < len(p.stack) {
+		if k, ok := p.stack[len(p.stack)-1].(Key); ok {
+			return EscapeDupSeg(string(k))
+		}
+		if 0 < len(p.starts) && 0 <= p.starts[len(p.starts)-1] {
+			return strconv.Itoa(len(p.stack) - p.starts[len(p.starts)-1] - 1)
+		}
+	}
+	return ""
 }
 
 func (p *Parser) newError(off int, format string, args ...any) error {

@@ -17,4 +17,13 @@
 //
 // Also included in the package are a builder and parser that behave like the
 // parser and builder in the oj package except for gen types.
+//
+// # Duplicate Object Keys
+//
+// The Parser handles duplicate object keys according to DupKeyOptions, which
+// is shared with the oj package. By default the last value wins, matching
+// the historical behavior. The mode can instead keep the first value, reject
+// the input with a *DupKeyError before the duplicate value is parsed, or
+// collect DupKeyDiag diagnostics (JSON Pointer path, decoded key, and raw
+// input byte offsets) while continuing to parse.
 package gen

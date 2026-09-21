@@ -42,6 +42,16 @@ Using JSONPath expressions:
     // returns [4]
 ```
 
+Controlling how duplicate object keys are handled (keep last by default;
+also keep first, reject, or report and continue):
+
+```golang
+    opts := &oj.DupKeyOptions{Mode: oj.DupKeyReport}
+    obj, err := oj.ParseString(`{"a":1,"a":2}`, opts)
+    // obj is map[string]any{"a": 2} and opts.Diags reports the duplicate
+    // with a JSON Pointer path, the decoded key, and byte offsets.
+```
+
 The **oj** command (cmd/oj) uses JSON path for filtering and
 extracting JSON elements. It also includes sorting, reformatting,
 discovery of JSON in documents, and colorizing options.

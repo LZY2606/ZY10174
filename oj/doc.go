@@ -25,6 +25,25 @@
 //	var p oj.Parser
 //	v, err := p.Parse([]byte("[true,[false,[null],123],456]"))
 //
+// # Duplicate Object Keys
+//
+// Duplicate object keys are handled according to DupKeyOptions, a type
+// shared with the gen package so both parsers expose identical options and
+// diagnostics. The option can be set on a Parser or passed as a parse
+// argument.
+//
+//	v, err := oj.ParseString(`{"a":1,"a":2}`, &oj.DupKeyOptions{Mode: oj.DupKeyReport})
+//
+// The default mode keeps the last value, matching the historical behavior.
+// Other modes keep the first value, reject the input with a *DupKeyError
+// before the duplicate value is parsed, or collect DupKeyDiag diagnostics
+// while continuing. Diagnostics report a JSON Pointer path, the decoded key,
+// and byte offsets into the original UTF-8 input. Keys are compared after
+// decoding, so escaped spellings of the same key are duplicates. Report mode
+// bounds memory with configurable limits on the number of diagnostics, the
+// path length, and the retained input snippet length. Tracking adds one map
+// lookup per object key; the default mode adds no overhead.
+//
 // # Validator
 //
 // Validates a JSON file or stream. It can be used on a single JSON document or a
