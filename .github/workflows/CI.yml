@@ -1,0 +1,47 @@
+name: Go
+
+on:
+  push:
+    branches: [ develop, master ]
+  pull_request:
+    branches: [ develop ]
+
+jobs:
+
+  golangci:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu
+          - macos
+
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: 1.24
+
+    - name: Test
+      run: |
+        go test -covermode=count -coverprofile=cov.out  ./...
+        go tool cover -func=cov.out
+
+    # - name: Coverage
+    #   env:
+    #     COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    #   run: |
+    #     go install github.com/mattn/goveralls@latest
+    #     goveralls -coverprofile=cov.out -service=github
